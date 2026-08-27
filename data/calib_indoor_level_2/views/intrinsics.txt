@@ -1,0 +1,22 @@
+# Exact intrinsics of the synthesized rectilinear views.
+# Feed these to the calibrator as KNOWN intrinsics; do not solve for them.
+fov_deg 60.0
+width 480
+height 480
+fx 415.692193817
+fy 415.692193817
+cx 240.000000000
+cy 240.000000000
+k1 0
+k2 0
+p1 0
+p2 0
+k3 0
+
+# view_file yaw_deg pitch_deg
+view_00_yaw+000.00_pitch+00.00.png 0.000000 0.000000
+view_01_yaw+060.00_pitch+00.00.png 60.000000 0.000000
+view_02_yaw+120.00_pitch+00.00.png 120.000000 0.000000
+view_03_yaw+180.00_pitch+00.00.png 180.000000 0.000000
+view_04_yaw+240.00_pitch+00.00.png 240.000000 0.000000
+view_05_yaw+300.00_pitch+00.00.png 300.000000 0.000000

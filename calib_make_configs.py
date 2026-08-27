@@ -142,9 +142,9 @@ def find_calib_repo(explicit):
         except (subprocess.SubprocessError, OSError):
             pass
 
-    for cand in ("/catkin_ws/src/livox_camera_calib",
+    for cand in ("livox_camera_calib",
                  os.path.expanduser("~/catkin_ws/src/livox_camera_calib"),
-                 "/root/catkin_ws/src/livox_camera_calib"):
+                 "/catkin_ws/src/livox_camera_calib"):
         if os.path.isdir(os.path.join(cand, "config")):
             return cand
     return None

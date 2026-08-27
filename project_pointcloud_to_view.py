@@ -9,13 +9,15 @@ debug output.
     python3 project_pointcloud_to_view.py --data-dir data/calib_data_yard_1 --view 5
 
 Defaults to that view's seed guess (data/guesses/guess_NN_*.txt); pass
---extrinsic to check any other 4x4/3x4 pose file (e.g. a solved result)
+--extrinsic to check any other 4x4/3x4 pose file (e.g. a solved result, or a
+livox_camera_calib config_NN.yaml -- its ExtrinsicMat is read directly)
 against the same image instead.
 """
 import argparse
 import glob
 import math
 import os
+import re
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -38,13 +40,23 @@ def load_pcd_xyzi(path):
 
 
 def load_extrinsic(path):
-    """Read a 4x4, 3x4, or 16/12-number whitespace/comma-separated pose file."""
-    vals = []
+    """Read a pose from either a plain 4x4/3x4 number file, or a livox_camera_calib
+    config_NN.yaml (OpenCV FileStorage, ExtrinsicMat: !!opencv-matrix ... data: [...])."""
     with open(path) as f:
-        for line in f:
+        text = f.read()
+
+    if 'ExtrinsicMat' in text:
+        m = re.search(r'ExtrinsicMat\s*:.*?data\s*:\s*\[([^\]]*)\]', text, re.S)
+        if not m:
+            raise SystemExit(f"{path}: found 'ExtrinsicMat' but couldn't parse its data: [...] block")
+        vals = [float(v) for v in m.group(1).replace(',', ' ').split()]
+    else:
+        vals = []
+        for line in text.splitlines():
             line = line.split('#')[0].strip()
             if line:
                 vals.extend(float(v) for v in line.replace(',', ' ').split())
+
     arr = np.array(vals, dtype=float)
     if arr.size == 16:
         T = arr.reshape(4, 4)
@@ -102,7 +114,7 @@ def project(args):
     if args.extrinsic:
         extrinsic_path = args.extrinsic
     else:
-        pattern = os.path.join(HERE, 'data', 'guesses', f'guess_{args.view:02d}_*.txt')
+        pattern = os.path.join(data_dir, 'guesses', f'guess_{args.view:02d}_*.txt')
         matches = glob.glob(pattern)
         if not matches:
             raise SystemExit(f"no seed guess found matching {pattern}")
@@ -150,7 +162,7 @@ def project(args):
             draw.ellipse([uu - r, vv - r, uu + r, vv + r], fill=(int(cr), int(cg), int(cb)))
 
     out_path = args.out or os.path.join(
-        HERE, f"project_view{args.view:02d}_{os.path.splitext(os.path.basename(extrinsic_path))[0]}.png")
+        views_dir, f"project_view{args.view:02d}_{os.path.splitext(os.path.basename(extrinsic_path))[0]}.png")
     img.save(out_path)
     print(f"wrote      : {out_path}")
 
@@ -160,7 +172,10 @@ def main():
     p.add_argument('--data-dir', required=True, help='dataset dir holding views/ and cloud.pcd, '
                                                         'e.g. data/calib_data_yard_1')
     p.add_argument('--view', type=int, default=5, help='view index (0-based)')
-    p.add_argument('--extrinsic', help='pose file to project with; defaults to that view\'s seed guess')
+    p.add_argument('--extrinsic', help='pose file to project with -- a plain 4x4/3x4 number file '
+                                        '(e.g. a guess or solved extrinsic_NN.txt) or a '
+                                        'livox_camera_calib config_NN.yaml (reads ExtrinsicMat); '
+                                        'defaults to that view\'s seed guess')
     p.add_argument('--out', help='output image path')
     p.add_argument('--near-clip', type=float, default=0.1, help='behind-camera guard on camera-frame Z, not real range')
     p.add_argument('--min-depth', type=float, default=0.3, help='drop points closer than this range -- the drone body self-occludes here')
