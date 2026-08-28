@@ -91,13 +91,17 @@ def virtual_view_intrinsics(fov_deg, out_hw):
     return fx, fy, cx, cy
 
 
-def view_rotation(yaw_deg, pitch_deg):
+def view_rotation(yaw_deg, pitch_deg, roll_deg=0.0):
     """Rotation taking a virtual-camera (OpenCV) vector into the panorama frame.
 
-    p_panorama = view_rotation(yaw, pitch) @ p_virtual_camera
+    p_panorama = view_rotation(yaw, pitch, roll) @ p_virtual_camera
 
     yaw rotates about the panorama's up axis (positive = toward +y = left);
-    pitch tilts the view up (positive) or down (negative).
+    pitch tilts the view up (positive) or down (negative);
+    roll spins the view about its own optical axis, positive lifting its LEFT
+    side -- the same sign convention as calib_prepare_views.rpy_to_matrix, so a
+    mounting roll and a view roll read the same way. Roll leaves the view's
+    centre bearing untouched; it only reframes what is level in the cut-out.
 
     At yaw=pitch=0 this is the pure OpenCV->spherical axis swap:
         [[0, 0, 1], [-1, 0, 0], [0, -1, 0]]
@@ -123,14 +127,24 @@ def view_rotation(yaw_deg, pitch_deg):
     down = np.cross(forward, right)
 
     # Columns are the virtual camera's x/y/z axes expressed in the panorama frame.
-    return np.column_stack([right, down, forward])
+    r = np.column_stack([right, down, forward])
+
+    if roll_deg:
+        # Post-multiply: the spin happens in the camera's own frame, about +z
+        # (forward). Lifting the LEFT side tips the camera's x=right axis DOWN,
+        # which is +y in OpenCV -- hence this sign and not its transpose.
+        c, sn = math.cos(math.radians(roll_deg)), math.sin(math.radians(roll_deg))
+        r = r @ np.array([[c, -sn, 0.0],
+                          [sn, c, 0.0],
+                          [0.0, 0.0, 1.0]])
+    return r
 
 
 # Pure OpenCV -> panorama-spherical axis swap (a forward-looking view).
 OPENCV_TO_SPHERICAL = view_rotation(0.0, 0.0)
 
 
-def view_pixel_to_bearing(px, py, fov_deg, yaw_deg, pitch_deg, out_hw):
+def view_pixel_to_bearing(px, py, fov_deg, yaw_deg, pitch_deg, out_hw, roll_deg=0.0):
     """Virtual-view pixel -> unit bearing in the panorama spherical frame."""
     fx, fy, cx, cy = virtual_view_intrinsics(fov_deg, out_hw)
     px = np.asarray(px, dtype=float)
@@ -139,20 +153,22 @@ def view_pixel_to_bearing(px, py, fov_deg, yaw_deg, pitch_deg, out_hw):
                      (py - cy) / fy,
                      np.ones_like(px)], axis=-1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
-    return rays @ view_rotation(yaw_deg, pitch_deg).T
+    return rays @ view_rotation(yaw_deg, pitch_deg, roll_deg).T
 
 
-def view_pixel_to_panorama_pixel(px, py, fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh):
+def view_pixel_to_panorama_pixel(px, py, fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh,
+                                 roll_deg=0.0):
     """Virtual-view pixel -> equirectangular panorama pixel.
 
     Use this to lift detections made on a rectilinear view back into panorama
     coordinates, which is the frame the colorizer's YOLO fusion consumes.
     """
-    bearing = view_pixel_to_bearing(px, py, fov_deg, yaw_deg, pitch_deg, out_hw)
+    bearing = view_pixel_to_bearing(px, py, fov_deg, yaw_deg, pitch_deg, out_hw, roll_deg)
     return bearing_to_pixel(bearing, pano_wh[0], pano_wh[1])
 
 
-def view_bbox_to_panorama_bbox(bbox, fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh):
+def view_bbox_to_panorama_bbox(bbox, fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh,
+                              roll_deg=0.0):
     """Axis-aligned view bbox -> axis-aligned panorama bbox.
 
     Samples the box outline rather than just its corners, because a straight edge in
@@ -169,7 +185,7 @@ def view_bbox_to_panorama_bbox(bbox, fov_deg, yaw_deg, pitch_deg, out_hw, pano_w
     edge_y = np.concatenate([y1 + (y2 - y1) * ts, y1 + (y2 - y1) * ts, np.full(n, y1), np.full(n, y2)])
 
     pano = view_pixel_to_panorama_pixel(edge_x, edge_y, fov_deg, yaw_deg, pitch_deg,
-                                        out_hw, pano_wh)
+                                        out_hw, pano_wh, roll_deg)
     xs = pano[..., 0]
     ys = pano[..., 1]
 
@@ -181,7 +197,7 @@ def view_bbox_to_panorama_bbox(bbox, fov_deg, yaw_deg, pitch_deg, out_hw, pano_w
     return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
 
 
-def build_view_maps(fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh):
+def build_view_maps(fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh, roll_deg=0.0):
     """Precompute cv2.remap sampling maps for one virtual view.
 
     The maps depend only on geometry, so build them once and reuse them per frame.
@@ -190,13 +206,13 @@ def build_view_maps(fov_deg, yaw_deg, pitch_deg, out_hw, pano_wh):
     grid_x, grid_y = np.meshgrid(np.arange(out_w, dtype=np.float32),
                                  np.arange(out_h, dtype=np.float32))
     pano = view_pixel_to_panorama_pixel(grid_x, grid_y, fov_deg, yaw_deg, pitch_deg,
-                                        out_hw, pano_wh)
+                                        out_hw, pano_wh, roll_deg)
     return (np.ascontiguousarray(pano[..., 0], dtype=np.float32),
             np.ascontiguousarray(pano[..., 1], dtype=np.float32))
 
 
 def extract_view(panorama, fov_deg, yaw_deg, pitch_deg, out_hw, maps=None,
-                 interpolation=None):
+                 interpolation=None, roll_deg=0.0):
     """Cut an exact rectilinear view out of an equirectangular panorama.
 
     Pass precomputed `maps` from build_view_maps to avoid rebuilding them per frame.
@@ -209,12 +225,13 @@ def extract_view(panorama, fov_deg, yaw_deg, pitch_deg, out_hw, maps=None,
         interpolation = cv2.INTER_CUBIC
     if maps is None:
         pano_h, pano_w = panorama.shape[:2]
-        maps = build_view_maps(fov_deg, yaw_deg, pitch_deg, out_hw, (pano_w, pano_h))
+        maps = build_view_maps(fov_deg, yaw_deg, pitch_deg, out_hw, (pano_w, pano_h),
+                               roll_deg)
     return cv2.remap(panorama, maps[0], maps[1], interpolation,
                      borderMode=cv2.BORDER_WRAP)
 
 
-def compose_lidar_extrinsic(r_cv_lidar, t_cv_lidar, yaw_deg, pitch_deg):
+def compose_lidar_extrinsic(r_cv_lidar, t_cv_lidar, yaw_deg, pitch_deg, roll_deg=0.0):
     """Lift a per-view calibration result into the panorama frame.
 
     A calibrator solving against the virtual view returns the OpenCV-convention pose
@@ -223,7 +240,7 @@ def compose_lidar_extrinsic(r_cv_lidar, t_cv_lidar, yaw_deg, pitch_deg):
     colorizer wants in equirectangular mode:
         p_panorama = R @ p_lidar + t
     """
-    r_pano_cv = view_rotation(yaw_deg, pitch_deg)
+    r_pano_cv = view_rotation(yaw_deg, pitch_deg, roll_deg)
     r = r_pano_cv @ np.asarray(r_cv_lidar, dtype=float).reshape(3, 3)
     t = r_pano_cv @ np.asarray(t_cv_lidar, dtype=float).reshape(3)
 
