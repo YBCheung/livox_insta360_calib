@@ -171,6 +171,41 @@ python3 calib/calib_prepare_views.py compose \
 baseline). More than that, or >2° rotation, means a view didn't converge — drop it
 and re-run rather than averaging it in.
 
+## Visualizing before you trust a result
+
+Two standalone tools, usable at any point — on a seed before you've even run the
+calibrator, or on a solved result afterward. Neither needs `livox_camera_calib` or
+ROS; both only need `numpy` (+ `Pillow` for the first), so they run equally well on
+the Pi or the laptop, inside or outside the container.
+
+**1. Project the cloud onto one view's image, via any extrinsic file:**
+
+```bash
+python3 calib/project_pointcloud_to_view.py --data-dir calib/data/calib_data_yard_1 --view 5
+```
+
+Colors the cloud by depth and draws it over that view's cut image — a flat 2D
+overlay, one view at a time. Defaults to that view's seed guess
+(`data/guesses/guess_NN_*.txt`); pass `--extrinsic path/to/extrinsic_05.txt` to check
+a solved result instead, against the exact same image, so seed and solved are
+directly comparable. `--min-depth` drops near-field self-occlusion from the drone
+body (default 0.3 m); `--max-depth` caps the far end.
+
+**2. View a whole dataset's camera FOVs against the point cloud, in 3D:**
+
+```bash
+python3 calib/visualize_seed_fov.py --dataset calib_data_yard_1
+```
+
+Writes one self-contained `.html` (point cloud + all 6 seed FOVs baked in) that
+opens directly in a browser — no server, nothing else to install. Pick a single
+view to extend its FOV boundary and a bright centre beam to real room/yard scale, so
+it visibly slices through the actual structure instead of a small decorative marker.
+Also has a "Level to gravity" toggle (a RANSAC ground-plane fit, independent of
+`calib_capture.py`'s own IMU-based measurement) for a quick visual gut-check of how
+tilted a capture was. Re-run any time the dataset changes — it just overwrites the
+output file.
+
 ## 6. Apply
 
 Paste the printed `T_cam_lidar: [...]` into `mid360_insta360.yaml`, then:
@@ -184,6 +219,64 @@ depth edges. Smearing tells you the axis: horizontal → yaw, vertical → pitch
 with distance → translation.
 
 To disable the fusion without touching SLAM: `colorizer:=false`.
+
+## Downstream: matching a 2D detection bbox to a point-cloud object
+
+Not calibration itself — a downstream consumer of a solved `T_cam_lidar` (or any
+per-view `extrinsic_NN.txt`): given a 2D detection box in one view (e.g. a YOLO
+bbox), find the matching object in the point cloud and report its center/bottom/top
+3D coordinates. Same pinhole math as `project_pointcloud_to_view.py`, run in
+reverse — points are projected into the image and filtered by which ones land
+inside the box, rather than the whole cloud being drawn over it.
+
+**Pipeline** (`bench_bbox_to_tree.py`):
+
+1. **Frustum select** — project the whole cloud, keep points landing inside the
+   bbox's pixel range and in front of the camera.
+2. **Depth-mode gate** — histogram the candidates' range, keep a MAD window around
+   the dominant peak. Drops background/foreground sitting at a different range than
+   the object, which a loose box otherwise pulls in along the same pixel columns.
+3. **Connected-component clustering** — 6-connected voxel-grid union-find (no
+   scipy/sklearn dependency) splits the depth-gated points into distinct physical
+   objects. A box frequently straddles the target *and* a background surface at a
+   similar range (e.g. a wall panel behind a chair) that only shares one gated blob
+   by luck.
+4. **Cluster selection** — default to the largest cluster (correct for a reasonably
+   tight box); only override it when that cluster's centroid is clearly off-center
+   in the image *and* a substantially-sized alternative sits clearly near the box
+   center. Picking by raw size alone latches onto a big background surface; picking
+   by centrality alone loses a large, correctly-shaped object to a stray noise
+   cluster that happens to be more central. Comparable-sized fragments near the
+   winner (e.g. a chair's separated leg/armrest returns) are merged back in.
+5. **Keypoints** — median center, 1st/99th-percentile top/bottom along the up axis
+   (not min/max — a couple of stray points shouldn't set the extent).
+
+**Tools:**
+
+| | |
+|---|---|
+| `bench_bbox_to_tree.py` | fixed-bbox timing benchmark, no YOLO — measures the matching cost in isolation |
+| `visualize_bbox_match.py` | static PNG: bbox + candidate/gated/cluster points + center/bottom/top markers, for one fixed bbox |
+| `interactive_bbox_match.py` | Tkinter UI — drag a box on the view image with the mouse, see the match live |
+
+```bash
+python3 calib/interactive_bbox_match.py --data-dir calib/data/calib_indoor_level --view 5 \
+    --extrinsic calib/configs/results/extrinsic_05.txt
+```
+
+**Use a solved extrinsic, not a seed guess** (`--extrinsic path/to/extrinsic_NN.txt`).
+A seed is only accurate to ~5–10°, which is enough to sanity-check a calibration
+visually but not enough for step 1's frustum select to land on the right object.
+
+**Real-time note:** the expensive step is the whole-cloud projection in step 1
+(~23 ms for ~1M points on a laptop CPU, single-threaded) — everything downstream
+(mask/gate/cluster/keypoints) runs in a few ms on the resulting few-thousand-point
+candidate set. For a fixed camera pose, project once and cache it; only rerun the
+cheap downstream steps per new bbox, rather than reprojecting the whole cloud on
+every detection. That split is what keeps a single-view 10 Hz match loop plausible
+on something like a Raspberry Pi 5, where a Hailo-8/Coral-class accelerator running
+the detector itself leaves the CPU free for this part — not yet benchmarked on
+that hardware, so treat it as a target to validate rather than a measured number.
 
 ## Before you calibrate: T_cam_lidar must match what the colorizer actually does
 
@@ -225,6 +318,11 @@ only uses for YOLO 3D accumulation.
 | `calib_capture.py` | grabs one panorama + a dense raw-frame cloud, measuring tilt via `/livox/imu` as a diagnostic (ROS2) |
 | `calib_prepare_views.py` | `bearing` / `guess` / `cut` / `compose` |
 | `calib_make_configs.py` | generates `livox_camera_calib` configs (run on ROS1) |
+| `project_pointcloud_to_view.py` | 2D check: project the cloud onto one view's image via any extrinsic file |
+| `visualize_seed_fov.py` | 3D check: writes a self-contained HTML viewer of a dataset's camera FOVs against its point cloud |
+| `bench_bbox_to_tree.py` | bbox → point-cloud object match: pipeline + fixed-bbox timing benchmark |
+| `visualize_bbox_match.py` | static PNG of a bbox match (candidates/gated/cluster points + keypoints) |
+| `interactive_bbox_match.py` | mouse-driven UI for the bbox match, live on one view |
 | `docker/` | ROS1 Noetic image + build/run scripts for the calibrator |
 | `data/` | captured panorama, cloud, views, guesses |
 | `configs/` | generated calibrator configs + results |

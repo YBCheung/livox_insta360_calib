@@ -1,0 +1,13 @@
+<launch>
+  <!-- Auto-generated. Lets one config be chosen per run, leaving the cloned
+       livox_camera_calib repo untouched (its own calib.launch hardcodes
+       config/calib.yaml). Run by path:
+         roslaunch /calib/configs/calib_view.launch config:=<...>/calib_00.yaml -->
+  <arg name="config" />
+    <!-- Load to global scope for binaries using NodeHandle() param lookup. -->
+    <rosparam command="load" file="$(arg config)" />
+  <node pkg="livox_camera_calib" type="lidar_camera_calib" name="lidar_camera_calib" output="screen">
+        <!-- Also load to private scope for binaries using private (~) lookup. -->
+    <rosparam command="load" file="$(arg config)" />
+  </node>
+</launch>
