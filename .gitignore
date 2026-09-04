@@ -1,3 +1,4 @@
-data/calib_data*/
+data/
 data/data_high_bad_optim/
 configs_high/
+__pycache__/

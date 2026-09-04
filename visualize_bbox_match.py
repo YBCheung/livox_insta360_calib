@@ -21,7 +21,8 @@ import os
 import numpy as np
 from PIL import Image, ImageDraw
 
-from project_pointcloud_to_view import load_pcd_xyzi, load_extrinsic, load_intrinsics
+from project_pointcloud_to_view import (load_pcd_xyzi, load_extrinsic, load_intrinsics,
+                                        apply_gravity_correction)
 from bench_bbox_to_tree import project_all, depth_mode_gate, pick_object_cluster
 
 
@@ -132,6 +133,10 @@ def main():
                                         '(e.g. a solved configs/results/extrinsic_NN.txt) or a '
                                         'livox_camera_calib config_NN.yaml; defaults to that '
                                         "view's seed guess")
+    p.add_argument('--gravity', help='gravity.txt with a FRESH up_measured reading for the '
+                                      "rig's CURRENT tilt -- re-derives the extrinsic for it "
+                                      'instead of assuming the rig is still level (see '
+                                      'project_pointcloud_to_view.apply_gravity_correction)')
     args = p.parse_args()
 
     data_dir = os.path.abspath(args.data_dir)
@@ -142,6 +147,7 @@ def main():
     view_file, yaw, pitch = manifest[args.view]
     extrinsic_path = find_extrinsic(data_dir, args.view, args.extrinsic)
     R, t = load_extrinsic(extrinsic_path)
+    R, t = apply_gravity_correction(R, t, args.gravity)
 
     pts = load_pcd_xyzi(os.path.join(data_dir, 'cloud.pcd'))
     xyz = pts[:, :3].astype(np.float64)

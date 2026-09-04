@@ -18,11 +18,14 @@ import glob
 import math
 import os
 import re
+import sys
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import insta360_views as iv
 
 
 def load_pcd_xyzi(path):
@@ -66,6 +69,38 @@ def load_extrinsic(path):
     else:
         raise SystemExit(f"{path}: expected 12 or 16 numbers, got {arr.size}")
     return T[:3, :3], T[:3, 3]
+
+
+def load_gravity_up(path):
+    """Read the 'up_measured' unit vector (RAW LiDAR frame) out of a gravity.txt
+    written by calib_capture.py. Pass a FRESH one (the rig's current attitude),
+    not necessarily the calibration-time file -- see gravity_correct_extrinsic()."""
+    with open(path) as f:
+        for line in f:
+            parts = line.split('#')[0].split()
+            if len(parts) == 4 and parts[0] == 'up_measured':
+                return np.array([float(v) for v in parts[1:]], dtype=float)
+    raise SystemExit(f"{path}: no 'up_measured' line found -- is this a gravity.txt "
+                     f"from calib_capture.py?")
+
+
+def apply_gravity_correction(R, t, gravity_path):
+    """If --gravity is given, re-derive (R, t) for the rig's CURRENT tilt.
+
+    A per-view extrinsic is only exactly right at the attitude it was calibrated
+    at (rig level) -- see insta360_views.gravity_correct_extrinsic() for why. This
+    reads a fresh up_measured reading and folds in the same re-leveling rotation
+    the Insta360 stitcher is continuously applying to its own output, so the raw
+    (still-tilted) LiDAR cloud lines back up with the (always-level) image.
+    Returns (R, t) unchanged if gravity_path is falsy.
+    """
+    if not gravity_path:
+        return R, t
+    up_now = load_gravity_up(gravity_path)
+    R_eff, t_eff = iv.gravity_correct_extrinsic(R, t, up_now, iv.OPENCV_VIEW_UP)
+    angle = math.degrees(math.acos(np.clip((np.trace(R_eff @ R.T) - 1) / 2, -1, 1)))
+    print(f"gravity correction from {gravity_path}: {angle:.2f} deg re-level applied to the extrinsic")
+    return R_eff, t_eff
 
 
 def load_intrinsics(views_dir):
@@ -121,6 +156,7 @@ def project(args):
         extrinsic_path = matches[0]
 
     R, t = load_extrinsic(extrinsic_path)
+    R, t = apply_gravity_correction(R, t, args.gravity)
     pts = load_pcd_xyzi(os.path.join(data_dir, 'cloud.pcd'))
     xyz = pts[:, :3].astype(np.float64)
 
@@ -176,6 +212,12 @@ def main():
                                         '(e.g. a guess or solved extrinsic_NN.txt) or a '
                                         'livox_camera_calib config_NN.yaml (reads ExtrinsicMat); '
                                         'defaults to that view\'s seed guess')
+    p.add_argument('--gravity', help='gravity.txt with a FRESH up_measured reading for the '
+                                      'rig\'s CURRENT tilt (e.g. from a quick calib_capture.py '
+                                      '--seconds 3 run) -- re-derives the extrinsic for that '
+                                      'tilt instead of assuming the rig is still level, since '
+                                      'the Insta360 stays gravity-locked but the raw LiDAR '
+                                      'cloud does not')
     p.add_argument('--out', help='output image path')
     p.add_argument('--near-clip', type=float, default=0.1, help='behind-camera guard on camera-frame Z, not real range')
     p.add_argument('--min-depth', type=float, default=0.3, help='drop points closer than this range -- the drone body self-occludes here')

@@ -55,24 +55,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, Imu
 
-
-def rotation_aligning(a, b):
-    """Shortest-arc rotation matrix taking unit vector a onto unit vector b."""
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-    v = np.cross(a, b)
-    s = np.linalg.norm(v)
-    c = np.dot(a, b)
-    if s < 1e-9:
-        if c > 0:
-            return np.eye(3)
-        perp = np.cross(a, [1.0, 0.0, 0.0])
-        if np.linalg.norm(perp) < 1e-6:
-            perp = np.cross(a, [0.0, 1.0, 0.0])
-        perp /= np.linalg.norm(perp)
-        return 2 * np.outer(perp, perp) - np.eye(3)
-    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-    return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from insta360_views import rotation_aligning
 
 
 def write_pcd_binary(path, xyzi):

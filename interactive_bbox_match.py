@@ -27,13 +27,15 @@ import tkinter as tk
 import numpy as np
 from PIL import Image, ImageTk
 
-from project_pointcloud_to_view import load_pcd_xyzi, load_extrinsic, load_intrinsics
+from project_pointcloud_to_view import (load_pcd_xyzi, load_extrinsic, load_intrinsics,
+                                        apply_gravity_correction)
 from bench_bbox_to_tree import project_all
 from visualize_bbox_match import find_extrinsic, render_match_overlay, draw_legend
 
 
 class BBoxMatchApp:
-    def __init__(self, root, data_dir, view_idx, extrinsic_path, up_axis, scale, point_radius):
+    def __init__(self, root, data_dir, view_idx, extrinsic_path, up_axis, scale, point_radius,
+                 gravity_path=None):
         self.up_axis = up_axis
         self.scale = scale
         self.point_radius = point_radius
@@ -46,6 +48,7 @@ class BBoxMatchApp:
 
         extrinsic_path = find_extrinsic(data_dir, view_idx, extrinsic_path)
         self.R, self.t = load_extrinsic(extrinsic_path)
+        self.R, self.t = apply_gravity_correction(self.R, self.t, gravity_path)
 
         root.title(f"bbox match -- {os.path.basename(data_dir)} view {view_idx} "
                    f"({os.path.basename(extrinsic_path)})")
@@ -158,10 +161,15 @@ def main():
     p.add_argument('--up-axis', type=int, default=2, help='0=x,1=y,2=z world-up column')
     p.add_argument('--scale', type=float, default=1.6, help='display zoom factor for the (small) view images')
     p.add_argument('--point-radius', type=float, default=1.6)
+    p.add_argument('--gravity', help='gravity.txt with a FRESH up_measured reading for the '
+                                      "rig's CURRENT tilt -- re-derives the extrinsic for it "
+                                      'instead of assuming the rig is still level (see '
+                                      'project_pointcloud_to_view.apply_gravity_correction)')
     args = p.parse_args()
 
     root = tk.Tk()
-    BBoxMatchApp(root, args.data_dir, args.view, args.extrinsic, args.up_axis, args.scale, args.point_radius)
+    BBoxMatchApp(root, args.data_dir, args.view, args.extrinsic, args.up_axis, args.scale,
+                 args.point_radius, args.gravity)
     root.mainloop()
 
 

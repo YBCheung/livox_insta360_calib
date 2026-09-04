@@ -31,6 +31,14 @@ FORWARD = np.array([1.0, 0.0, 0.0])
 LEFT = np.array([0.0, 1.0, 0.0])
 UP = np.array([0.0, 0.0, 1.0])
 
+# "True up" as seen in a per-view OpenCV frame (x=right, y=down, z=forward): every
+# extracted view is cut with its vertical image axis aligned to the panorama's UP
+# (see view_rotation's `down = cross(forward, right)`), so +y (down) is real-world
+# down and this is real-world up. Use this as `cam_up` in gravity_correct_extrinsic
+# for any per-view extrinsic (a seed guess or a solved extrinsic_NN.txt); use UP
+# above instead for a composed panorama-frame T_cam_lidar.
+OPENCV_VIEW_UP = np.array([0.0, -1.0, 0.0])
+
 
 def pixel_to_bearing(x, y, width, height):
     """Equirectangular pixel -> unit bearing vector in the panorama spherical frame.
@@ -256,6 +264,60 @@ def average_extrinsics(transforms):
     T[:3, :3] = r
     T[:3, 3] = sum(T_i[:3, 3] for T_i in transforms) / len(transforms)
     return T
+
+
+def rotation_aligning(a, b):
+    """Shortest-arc rotation matrix taking unit vector a onto unit vector b."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    s = np.linalg.norm(v)
+    c = np.dot(a, b)
+    if s < 1e-9:
+        if c > 0:
+            return np.eye(3)
+        perp = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(perp) < 1e-6:
+            perp = np.cross(a, [0.0, 1.0, 0.0])
+        perp /= np.linalg.norm(perp)
+        return 2 * np.outer(perp, perp) - np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+
+def gravity_correct_extrinsic(R, t, up_lidar, cam_up):
+    """Re-derive a fixed T_cam_lidar for the rig's CURRENT tilt.
+
+    The Insta360 stitches gravity-locked (FlowState/horizon-lock ON): its output is
+    continuously re-leveled to true vertical no matter how the rig is tilted. A
+    calibrated (R, t) is only exempt from needing that same re-leveling because it
+    was solved while the rig happened to be level -- at that one attitude, the
+    stitcher had nothing to correct, so the rigid camera-lidar mount transform and
+    the calibrated extrinsic coincide. At any other attitude they don't: the raw
+    LiDAR cloud tilts with the rig while the image does not, and a fixed (R, t)
+    silently drifts off by exactly that difference.
+
+    This reproduces the same re-leveling rotation the stitcher applied, from a
+    gravity reading in the RAW LiDAR frame, and folds it into (R, t):
+
+        up_lidar    current "up" in the raw LiDAR frame -- a stationary
+                    accelerometer average (see gravity.txt / calib_capture.py)
+                    while hovering/still, or, for a moving rig where that
+                    assumption breaks, the world "up" axis rotated into the
+                    current LiDAR body frame by a LiDAR-inertial odometry
+                    estimate (e.g. FAST-LIO's orientation, whose world frame is
+                    itself gravity-aligned at init) instead of raw accel.
+        cam_up      the direction that is "true up" in (R, t)'s output frame --
+                    insta360_views.UP for a composed panorama-frame T_cam_lidar,
+                    OPENCV_VIEW_UP for a per-view OpenCV extrinsic.
+
+    Returns (R_eff, t_eff): use these in place of (R, t) for this instant.
+    """
+    up_in_cam_frame = R @ (np.asarray(up_lidar, dtype=float) / np.linalg.norm(up_lidar))
+    R_delta = rotation_aligning(up_in_cam_frame, cam_up)
+    return R_delta @ np.asarray(R, dtype=float), R_delta @ np.asarray(t, dtype=float)
 
 
 def format_t_cam_lidar_yaml(T, indent=26):

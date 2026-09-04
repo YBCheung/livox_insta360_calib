@@ -310,11 +310,55 @@ behavior, not a calibration bug. Fixing it fully would mean teaching the coloriz
 to compose `T_cam_lidar` with the odometry it already subscribes to but currently
 only uses for YOLO 3D accumulation.
 
+## Tilt-robust matching: correcting for the Insta360's gravity-lock
+
+The consequence above is fixed for the **offline bbox-matching tools**
+(`project_pointcloud_to_view.py`, `bench_bbox_to_tree.py`, `visualize_bbox_match.py`,
+`interactive_bbox_match.py` — not the live colorizer, which is outside this repo).
+
+The insight: a calibrated extrinsic is only exactly correct at the one attitude it
+was solved at (rig level) *because* at that attitude the Insta360's gravity-lock had
+nothing to correct — the calibrated rotation and the rigid camera↔LiDAR mount happen
+to coincide. At any other tilt they don't: the panorama keeps re-leveling itself to
+true vertical, but the raw LiDAR cloud tilts right along with the rig. Livox's own
+IMU can measure that same tilt (it's exactly what `gravity.txt` already records), so
+the same re-leveling rotation the camera applied to itself can be re-derived and
+folded into the extrinsic before projecting.
+
+Pass a **fresh** `gravity.txt` (the rig's tilt *right now*, not the calibration-time
+one) via `--gravity` on any of the four matching tools:
+
+```bash
+python3 calib/interactive_bbox_match.py --data-dir calib/data/calib_indoor_level --view 5 \
+    --extrinsic calib/configs/results/extrinsic_05.txt \
+    --gravity calib/data/current_tilt/gravity.txt
+```
+
+`--gravity` pointing at the *same* dataset's own `gravity.txt` should report a
+correction of only a degree or so (self-consistency: the extrinsic was solved
+against that very tilt). A meaningfully different tilt shifts the reported
+correction angle roughly one-to-one with how far the rig has moved off level.
+
+**Getting a fresh `up_measured`:**
+- **Stationary** (hovering/held still): a quick `calib_capture.py --seconds 3 --out
+  <dir>` grabs enough `/livox/imu` samples for `gravity.txt` alone (its panorama
+  capture can be ignored). This is what `up_measured` already is — a stationary
+  accelerometer reading pure `+g`.
+- **Moving:** a raw accelerometer reads net (gravity + vehicle) acceleration, so
+  averaging it in flight is wrong. Use a LiDAR-inertial odometry estimate instead
+  (e.g. FAST-LIO's orientation, whose world frame is itself gravity-aligned at
+  init) — rotate the world's up axis into the current LiDAR body frame with it and
+  feed that in as `up_measured`. Not wired up in this repo yet; `--gravity` just
+  needs *a* current up vector in the raw LiDAR frame, from whichever source is live.
+
+The math lives in `insta360_views.gravity_correct_extrinsic()`; the CLI plumbing is
+`project_pointcloud_to_view.apply_gravity_correction()`, reused by all four tools.
+
 ## Files
 
 | | |
 |---|---|
-| `insta360_views.py` | projection math — panorama↔bearing, view extraction, extrinsic composition. Shared with the future YOLO split-view node. |
+| `insta360_views.py` | projection math — panorama↔bearing, view extraction, extrinsic composition, gravity-lock correction. Shared with the future YOLO split-view node. |
 | `calib_capture.py` | grabs one panorama + a dense raw-frame cloud, measuring tilt via `/livox/imu` as a diagnostic (ROS2) |
 | `calib_prepare_views.py` | `bearing` / `guess` / `cut` / `compose` |
 | `calib_make_configs.py` | generates `livox_camera_calib` configs (run on ROS1) |
