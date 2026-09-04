@@ -1,2 +1,6 @@
-data/data_high_bad_optim/
+data/**/*
+!data/T_cam_lidar_indoor_level.txt
 configs_high/
+hailort.log
+__pycache__/
+

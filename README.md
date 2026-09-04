@@ -4,7 +4,9 @@ Self-contained bundle. Produces the `T_cam_lidar` that
 `src/realflight_modules/FAST_LIO_ROS2/config/mid360_insta360.yaml` needs for
 `projection_model: "equirectangular"`.
 
-Nothing here runs during flight — this is an offline, one-time procedure.
+The calibration itself is offline and one-time. The tools that *consume* the
+result — the extrinsic check and the bbox→object matchers — do run on the live
+rig; see **Running the live tools** below.
 
 ## Why the virtual-view detour
 
@@ -278,6 +280,293 @@ on something like a Raspberry Pi 5, where a Hailo-8/Coral-class accelerator runn
 the detector itself leaves the CPU free for this part — not yet benchmarked on
 that hardware, so treat it as a target to validate rather than a measured number.
 
+## Running the live tools (ROS 2, on the rig)
+
+Three tools run against the live rig instead of a capture. Each opens the camera
+**directly** with `cv2.VideoCapture` (no image topic in the loop) and claims the Hailo
+accelerator, so **only one may run at a time** — and none of them while
+`insta360_run.sh camera` or `fusion` is up, since that publisher holds `/dev/video0`
+too.
+
+| tool | answer is in | question it answers |
+|---|---|---|
+| `live_view_overlay.py` | — | is my extrinsic right? whole cloud painted by depth over the live views |
+| `live_cluster_match.py` | LiDAR frame | why did this object end up *there*? one detection taken apart, stage by stage |
+| `global_bbox_match.py` | **world frame** | where is this object globally? tilt-independent; optional RViz markers |
+
+### Container
+
+Use the runtime image that is already there — `livox-360-yolo-ego:latest`. It carries
+ROS 2 Humble, `rclpy`, OpenCV, `hailo_platform` and the Livox messages, and it runs
+privileged with host networking, so `/dev/hailo0` and `/dev/video0` are both reachable
+from inside. **Nothing here needs a new image built or started.**
+
+> `docker/` in this directory is unrelated: it is the ROS 1 Noetic image for
+> `livox_camera_calib`, used by step 4 and nothing else.
+
+Attach to a container that is already up:
+
+```bash
+docker ps                          # pick one running livox-360-yolo-ego:latest
+docker exec -it <name> bash
+```
+
+…or start one:
+
+```bash
+docker run -it --rm --privileged --network=host \
+    --env DISPLAY=:0 --env QT_X11_NO_MITSHM=1 \
+    --env ROS_DOMAIN_ID=0 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    --volume /home/yibo-rpi/yibo/vins_ego_ros2:/home/local \
+    --device /dev/ttyAMA0 --group-add dialout --group-add video \
+    livox-360-yolo-ego:latest \
+    bash -c 'cd /home/local && source install/setup.bash && exec bash'
+```
+
+`docker exec` bypasses the image's entrypoint, so a shell opened that way must source
+both prefixes itself — skip them and `rclpy` is simply not importable:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/local/install/setup.bash
+cd /home/local/src/livox_insta360_calib
+```
+
+### Prerequisites
+
+`./shfile/livox_imu.sh` (from `/home/local`) brings up the Livox driver **and**
+FAST-LIO2, which is both of the topics the live tools need:
+
+| topic | needed by | note |
+|---|---|---|
+| `/livox/lidar` | all three | `CustomMsg`, parsed straight from the CDR bytes |
+| `/Odometry` | `global_bbox_match.py` only | the camera pose **is** this topic; without it nothing can be placed in world coordinates |
+
+Check first — both should read ~10 Hz:
+
+```bash
+ros2 topic hz /livox/lidar
+ros2 topic hz /Odometry
+```
+
+### Models
+
+Both of these are compiled for HAILO8L and load on the Pi's accelerator:
+
+    src/hailo/yolov8s.hef
+    src/insta360/best_hailo_model/yolov8s_h8l.hef
+
+`src/insta360/best_hailo_model/best.hef` is compiled for **HAILO8**, not 8L, and will
+not load. When a HEF is rejected, compare `hailortcli parse-hef <hef>` against
+`hailortcli fw-control identify`.
+
+### Commands
+
+**Extrinsic check** — no detector, so it does not touch the accelerator:
+
+```bash
+python3 live_view_overlay.py --view 240 --view 300 \
+    --extrinsic data/T_cam_lidar_indoor_level.txt
+```
+
+**One detection taken apart, LiDAR frame:**
+
+```bash
+python3 live_cluster_match.py --view 240 \
+    --yolo /home/local/src/hailo/yolov8s.hef \
+    --translation 0.18 0.0 -0.13 --rpy 90 0 -23
+```
+
+**Object keypoints in world coordinates** — tilt-independent, and the one to use in
+flight:
+
+```bash
+python3 global_bbox_match.py --view 240 \
+    --yolo /home/local/src/hailo/yolov8s.hef \
+    --print --publish-markers
+```
+
+Headless (no X): add `--no-display`, which writes a PNG into `live_snapshots/` every
+2 s instead. Keys while running: `q` quit, `s` snapshot, `l` faint full cloud,
+`p` pause.
+
+The mounting arguments default to this rig, so `--translation` only needs overriding
+if the camera moves. `global_bbox_match.py` derives its single angle from
+`data/T_cam_lidar_indoor_level.txt` + `data/calib_indoor_level/gravity.txt` and prints
+it at startup (`+86.79°`) together with the residual camera tilt (`0.57°`) — which is
+the error floor of the whole gravity-lock assumption, 0.10 m at 10 m.
+
+### Markers
+
+`--publish-markers` publishes `visualization_msgs/MarkerArray` on `/yolo_objects` in
+the `world` frame at ~8 Hz: a bottom→top line, three spheres coloured to match the
+on-screen C/B/T, and a text label. Each array leads with `DELETEALL`, so a frame with
+fewer detections than the last leaves nothing stale behind. In RViz set the fixed
+frame to `world` and add a MarkerArray display on `/yolo_objects`.
+
+### Things that will bite
+
+| symptom | cause |
+|---|---|
+| `cannot open capture device 0` | something else holds the camera: a previous run, or `insta360_run.sh camera`/`fusion` |
+| `cannot load <hef>` | the accelerator is held by another process, or the HEF is HAILO8 rather than HAILO8L |
+| `No module named 'rclpy'` | the two `source` lines were skipped after `docker exec` |
+| `N frame(s) had no usable pose` | `/Odometry` is not publishing, or the stamp offset moved past `--max-pose-age` |
+| points lag or lead the image as you rotate | tune `--cam-latency` (default 0.05 s); at 90 °/s, 50 ms is 4.5° |
+| `raw CustomMsg parse rejected` | the CDR point stride is neither `n*20` nor `n*20 - 1` — the fallback is correct but costs 134 ms per message instead of 1.6 ms |
+
+Message stamps on this rig are **not** wall clock: the Livox timebase is not
+disciplined to the host, and the offset moves between runs (observed −1.04 s,
++0.045 s, +0.105 s). `global_bbox_match.py` measures it from every odometry message
+and prints the median at startup, so nothing needs configuring — but a `stamp offset`
+line far from zero is expected, not a fault. The camera stream carries no stamp at
+all, which is why frames are placed by wall-clock arrival and `--cam-latency` exists.
+
+## Offline: replaying a bag on a laptop
+
+`bag_bbox_match.py` is `global_bbox_match.py` with the four inputs swapped — same pose
+chain, same `fast` matcher, same world-frame output, no Hailo and no camera:
+
+| | on the rig | on a laptop |
+|---|---|---|
+| detector | HEF on a Hailo-8L | **Ultralytics `.pt`** on CPU or CUDA |
+| panorama | `cv2.VideoCapture` | `/insta360/image_raw/compressed` |
+| cloud | `/livox/lidar` live | `/livox/lidar` from the bag |
+| pose | `/Odometry` live | `/Odometry` from the bag |
+
+It reads the bag **directly** with `rosbag2_py` — do not `ros2 bag play` alongside it.
+Reading rather than replaying buys three things the live tool cannot have:
+
+- **every pose is interpolated, never extrapolated.** All of `/Odometry` is loaded in a
+  first pass before any image is touched, so a frame's pose is always bracketed by two
+  real samples. Live, odometry for an instant arrives *after* it.
+- **the LiDAR window is centred on the frame.** Offline there is lookahead, so a frame
+  matches against `[t-w/2, t+w/2]` instead of the trailing `[t-w, t]` a live loop is
+  stuck with — same point budget, half the mean temporal offset. `--trailing-window`
+  restores live behaviour when the point is to reproduce it.
+- **stamps, not arrival times.** Every message carries its own stamp and
+  `insta360_ros_publisher.py` stamps in the grab thread, so association is
+  stamp-to-stamp throughout. None of the live tool's wall-clock offset machinery runs.
+
+### Which cloud topic, and why not the easy one
+
+`/livox/lidar`, not `/cloud_registered` — even though the latter is already in the
+world frame and would need no pose at all. Measured on `kuusamo/manual_l2`:
+
+| topic | points per message (median) |
+|---|---|
+| `/livox/lidar` | **19,968** |
+| `/cloud_registered` | 675 |
+
+`/cloud_registered` is `feats_down_body`, voxel-filtered at `mapping.filter_size_surf`
+(0.5 m), so a person at 5 m survives as a handful of points — below `--min-points`
+before the matcher even starts. It only becomes usable with `dense_publish_en: true`
+in the FAST-LIO config, which publishes `feats_undistort` instead.
+
+The CDR bytes `rosbag2` returns are byte-identical to what a raw subscription
+delivers, so `LidarBuffer`'s numpy parser reads them directly: **1.6 ms** per message
+against 134 ms for `deserialize_message` — ~3 s versus ~5 minutes over a 212 s bag. It
+also means `livox_ros_driver2` need **not** be built on the laptop; only the fallback
+path would need the message class.
+
+### Requirements
+
+ROS 2 (for `rosbag2_py`, `rclpy`, `sensor_msgs`, `nav_msgs`) plus:
+
+```bash
+pip install ultralytics          # pulls torch; add a CUDA build for --device cuda
+```
+
+### Commands
+
+```bash
+python3 bag_bbox_match.py --bag ~/kuusamo/manual_l2 --view 240 --yolo yolov8s.pt
+```
+
+A slice of a long bag, on the GPU, with the results tabulated:
+
+```bash
+python3 bag_bbox_match.py --bag ~/kuusamo/manual_l2 --ring 6 --yolo-all-views \
+    --yolo yolo11s.pt --device cuda \
+    --start 60 --duration 40 --every 4 --csv objects.csv
+```
+
+`--start`/`--duration` slice by bag time, `--every N` subsamples frames, `--rate X`
+throttles to X times real time for watching, `--no-display` for batch. Keys: `q` quit,
+`space` pause, `s` snapshot, `l` faint full cloud.
+
+`--csv` writes one row per matched detection — `stamp, view, cls, label, conf, n_box,
+n_obj, range_m`, then `top/central/bottom` and the camera origin, all as world XYZ.
+
+The run ends with `N frame(s) processed, D detection(s), M object(s) located`, which
+separates the two ways to get nothing: `D=0` is the detector, `M=0` with `D>0` is the
+matcher.
+
+### What outdoor bags look like
+
+Measured on `manual_l2`, and worth knowing before reading a disappointing result:
+
+- **~72% of LiDAR points are `(0,0,0)`** — no return, because most of a 360° field of
+  view from a flying drone is sky. 20k points per message become ~5.6k real ones. The
+  tag filter is *not* what does this (it dropped 13 points in 1.2M); the finite and
+  non-zero mask is. Nothing is wrong when the in-view count looks thin.
+- **The airframe is in the panorama.** The 360 camera sees the drone's own arms, legs
+  and props, and YOLO fires on them — a propeller scored 0.55 as `person`, and the
+  matcher dutifully returned coordinates for it. Restrict with `--classes`, raise
+  `--min-depth` above the airframe, and choose view yaws that look away from the arms.
+- **Confidence has to come down** for distant small objects, and false positives come
+  up with it. At `--yolo-conf 0.15` on `yolov8n.pt` a forest yields `person`,
+  `fire hydrant` and `bear` on trees.
+- Sanity check the world frame by watching one static object across frames: a treeline
+  held x ≈ −9.1…−9.6 m over 30 s of flight while y swept 13.8→30 m.
+
+### Where the MID-360 can actually see — pick the view before blaming the matcher
+
+Two hard limits decide whether a view gets any points at all. Both were measured on
+`manual_l2`, and either one alone produces `D detections, 0 located`.
+
+**Elevation.** The MID-360 returns nothing below −7°:
+
+    elevation in the LiDAR/body frame:  min −7.0°   p50 +5.3°   max +50.5°
+        -15..-10 deg        0
+        -10.. -5 deg    12945  #####          <- hard floor at exactly -7.0 deg
+         -5.. +0 deg   132925  ############################################################
+
+So a view pitched −45° looks 38° below anything the sensor can ever return, and gets
+exactly zero points — not a calibration fault. It also means the ground is only seen
+in a **ring at ≈ 8.1 × altitude** (h / tan 7°): at 2.75 m that is ~22 m out. Anything
+directly below the drone is invisible to this LiDAR, however good the detection is.
+
+**Azimuth.** Coverage is wildly uneven — mean points in a fov60 view, by view yaw and
+pitch:
+
+    yaw \ pitch    -30     -20     -10       0     +10     +20
+      0           2294    2397    2380    2337    2224    1909
+     60             59     103     129     141     129     103
+     90              3       7       8       8       8       7     <- ~1000x null
+    120             16      17      18      20      18      17
+    180           1294    1413    1428    1339    1155     891
+    270           4281    4408    4372    4142    3531    2156     <- best
+    300           3826    4078    4082    3854    3322    2073
+
+The null spanning yaw 60–120 is the airframe occluding the sensor. Pitch barely
+matters by comparison; **yaw is the choice that decides whether the tool works.**
+
+Measured end to end with `yolo11n-tuesday.pt` (one class, `Sapling`) over the same
+30 s slice:
+
+| view | detections | located |
+|---|---|---|
+| `--view 90 -45 0 60` | 127 | **0** |
+| `--view 90 -20 0 60` and −10/0/+10 | 153 | **0** |
+| `--view 270 -20 0 60` | 280 | **222 (79%)** |
+
+At yaw 270 the matched saplings sit at 9.6–18 m — the ground ring, as predicted — and
+their heights come out sensible (top −0.52 / bottom −1.31 = 0.79 m; top +0.17 /
+bottom −1.78 = 1.95 m). Near saplings directly below the drone still match nothing,
+because no LiDAR return exists for them.
+
 ## Before you calibrate: T_cam_lidar must match what the colorizer actually does
 
 `lidar_camera_colorizer_node.cpp` projects **raw** `/livox/lidar` points straight
@@ -310,6 +599,14 @@ behavior, not a calibration bug. Fixing it fully would mean teaching the coloriz
 to compose `T_cam_lidar` with the odometry it already subscribes to but currently
 only uses for YOLO 3D accumulation.
 
+`global_bbox_match.py` does exactly that for the bbox→object path (not for the
+colorizer): it drops `T_cam_lidar` entirely and builds camera↔world from `/Odometry`
+each frame, so attitude cannot enter the chain. What makes that possible is visible
+in the calibration data itself — the solved extrinsic's camera *up* axis sits 0.57°
+from gravity up even though the LiDAR was 22.75° off level at capture, so the whole
+matrix collapses to one yaw angle plus a lever arm. The `roll -23` in the
+`--rpy 90 0 -23` seed is not a mounting roll at all; it is the LiDAR's own tilt.
+
 ## Files
 
 | | |
@@ -323,6 +620,13 @@ only uses for YOLO 3D accumulation.
 | `bench_bbox_to_tree.py` | bbox → point-cloud object match: pipeline + fixed-bbox timing benchmark |
 | `visualize_bbox_match.py` | static PNG of a bbox match (candidates/gated/cluster points + keypoints) |
 | `interactive_bbox_match.py` | mouse-driven UI for the bbox match, live on one view |
-| `docker/` | ROS1 Noetic image + build/run scripts for the calibrator |
+| `bbox_match.py` | the two isolation methods (`fast`, `cluster`) + the shared keypoint extraction |
+| `bbox_matching_paper_notes.md` | measured comparison of the two methods, and runtime benchmarks |
+| `hailo_yolo.py` | Hailo-8L YOLO wrapper (HEF load, inference, drawing) |
+| `live_view_overlay.py` | **live**: cloud over the live views, for judging an extrinsic on the rig |
+| `live_cluster_match.py` | **live**: YOLO → `cluster` match in the LiDAR frame, staged rendering |
+| `global_bbox_match.py` | **live**: YOLO → object keypoints in WORLD coordinates, tilt-independent; optional RViz markers |
+| `bag_bbox_match.py` | **offline**: the same, from a ros2 bag with an Ultralytics `.pt` — laptop, no Hailo |
+| `docker/` | ROS1 Noetic image + build/run scripts for the calibrator (step 4 only — not the runtime) |
 | `data/` | captured panorama, cloud, views, guesses |
 | `configs/` | generated calibrator configs + results |

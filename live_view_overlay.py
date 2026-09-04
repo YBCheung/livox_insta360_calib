@@ -30,6 +30,15 @@ the image -- a pole's points stay on the pole through a full sweep, a wall's poi
 stop at the wall's corner. Points sitting a consistent few pixels to one side is a
 rotation error; error that grows as things come closer is the lever arm.
 
+With --yolo <hef> a Hailo detector runs on the selected views, and each box is
+matched against the cloud to give the object's top / central / bottom point in the
+LiDAR frame. --match chooses how the object is separated from its background:
+'fast' (nearest range run) or 'cluster' (depth-mode gate + 3D voxel components);
+'both' runs each on the same box and draws them together -- white for fast, cyan
+for cluster -- which is the only honest way to compare them, since the camera and
+the accelerator are each exclusive to one process. See bbox_matching_paper_notes.md
+for the two algorithms and their measured differences.
+
 Keys: q / Esc quit, s save a snapshot, p toggle the panorama overlay,
       [ / ] shrink or grow the drawn points.
 
@@ -65,6 +74,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bbox_match as bm
 import insta360_views as iv
 from calib_prepare_views import rpy_to_matrix
 
@@ -346,10 +356,19 @@ class LidarBuffer:
         o += 4
 
         stride = self.POINT_STRIDE
-        if n <= 0 or len(buf) - o != n * stride - 1:
+        body = len(buf) - o
+        # Whether CDR pads the FINAL element is RMW-dependent: FastDDS leaves the last
+        # 19-byte point unpadded (n*20 - 1), CycloneDDS pads it to the full stride
+        # (n*20). Accept both. Insisting on one silently costs the entire point of
+        # this path -- measured on /livox/lidar under rmw_cyclonedds_cpp, the check
+        # rejected every message and fell back to 134 ms of rclpy deserialisation
+        # per scan, i.e. ~134% of a core at 10 Hz, in place of 1.6 ms.
+        if n <= 0 or body not in (n * stride, n * stride - 1):
             return None  # not the layout we expect -- fall back rather than guess
-        a = np.frombuffer(buf, np.uint8, n * stride - 1, o)
-        a = np.append(a, np.uint8(0)).reshape(n, stride)
+        a = np.frombuffer(buf, np.uint8, body, o)
+        if body < n * stride:
+            a = np.append(a, np.uint8(0))
+        a = a.reshape(n, stride)
         xyz = a[:, 4:16].copy().view(np.float32).reshape(n, 3)
         return xyz, a[:, 17]
 
@@ -563,11 +582,15 @@ class PanoramaSource:
 
 # -------------------------------------------------------------------------- drawing
 
+# The ramp only ever takes 256 values, so build it once and index it. Calling
+# applyColorMap on the frame's points instead costs 3x as much for the same output.
+_DEPTH_LUT = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(-1, 1),
+                               cv2.COLORMAP_TURBO).reshape(256, 3)
+
+
 def depth_colors(rng, dmin, dmax):
-    t = np.clip((rng - dmin) / max(1e-6, dmax - dmin), 0.0, 1.0)
-    lut = cv2.applyColorMap((t * 255).astype(np.uint8).reshape(-1, 1),
-                            cv2.COLORMAP_TURBO)
-    return lut.reshape(-1, 3)
+    t = np.clip((rng - dmin) * (255.0 / max(1e-6, dmax - dmin)), 0.0, 255.0)
+    return _DEPTH_LUT[t.astype(np.uint8)]
 
 
 def paint(img, u, v, rng, radius, dmin, dmax, alpha=1.0):
@@ -601,60 +624,7 @@ def paint(img, u, v, rng, radius, dmin, dmax, alpha=1.0):
     return len(u)
 
 
-def object_anchors(view, box, u, v, rng, cam_origin, shrink=0.6, gap=0.5, min_points=5):
-    """Top / central / bottom 3D points of the object inside one YOLO box.
-
-    A box is a rectangle, not a silhouette, so its points are the object PLUS whatever
-    the LiDAR saw past it. Two defences, in this order:
-
-      shrink  sample only the central fraction of the box, where the object is
-      gap     sort the remaining ranges, split them wherever there is a jump bigger
-              than `gap` metres, and keep the NEAREST run with real support. A person
-              in front of a wall gives two runs metres apart; the wall is discarded
-              however many points it contributed.
-
-    Top and bottom are read off the image row, not the LiDAR z: the row is what ties
-    them to the box, and the panorama is gravity-locked so image-up is already close
-    to world-up. Each is the mean of a decile band rather than a single extreme point,
-    which stops one stray return from defining the object's height.
-
-    Returns None when the box holds too few points to say anything honest.
-    """
-    x1, y1, x2, y2 = box[:4]
-    mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-    hw, hh = (x2 - x1) * 0.5 * shrink, (y2 - y1) * 0.5 * shrink
-    inside = (u >= mx - hw) & (u <= mx + hw) & (v >= my - hh) & (v <= my + hh)
-    if int(inside.sum()) < min_points:
-        return None
-
-    ub, vb, rb = u[inside], v[inside], rng[inside]
-    order = np.argsort(rb)
-    # Run boundaries only -- materialising every run (np.split) allocates a list of
-    # arrays we would throw away, and the nearest acceptable one is usually the first.
-    cuts = np.flatnonzero(np.diff(rb[order]) > gap) + 1
-    starts = np.concatenate(([0], cuts))
-    ends = np.concatenate((cuts, [len(rb)]))
-    need = max(min_points, int(0.15 * len(rb)))
-    run = next((k for k in range(len(starts)) if ends[k] - starts[k] >= need), None)
-    if run is None:
-        return None
-
-    sel = order[starts[run]:ends[run]]
-    ub, vb, rb = ub[sel], vb[sel], rb[sel]
-    pts = view.unproject(ub, vb, rb, cam_origin)
-
-    lo, hi = np.percentile(vb, [10.0, 90.0])
-    top_band, bot_band = vb <= lo, vb >= hi
-    return {
-        'top': pts[top_band].mean(axis=0),
-        'central': np.median(pts, axis=0),
-        'bottom': pts[bot_band].mean(axis=0),
-        'pixels': (float(ub[top_band].mean()), float(vb[top_band].mean()),
-                   float(np.median(ub)), float(np.median(vb)),
-                   float(ub[bot_band].mean()), float(vb[bot_band].mean())),
-        'range': float(np.median(rb)),
-        'n': int(len(rb)),
-    }
+MATCH_COLORS = {'fast': (255, 255, 255), 'cluster': (0, 220, 255)}
 
 
 def draw_anchors(img, anchor, color=(255, 255, 255)):
@@ -761,6 +731,9 @@ def main():
     d.add_argument('--max-depth', type=float, default=30.0,
                    help='colour ramp saturation range; points beyond it are dropped')
     d.add_argument('--point-radius', type=int, default=1)
+    d.add_argument('--stats', action='store_true',
+                   help='print a per-frame status line: points, fps, and the frames '
+                        'and LiDAR messages that were dropped')
     y = p.add_argument_group('yolo (Hailo)')
     y.add_argument('--yolo', metavar='HEF',
                    help='run a Hailo YOLO HEF on the selected views and draw the boxes')
@@ -782,6 +755,17 @@ def main():
                    help='fewest LiDAR returns a box needs before a position is claimed')
     y.add_argument('--yolo-print', action='store_true',
                    help='echo each detection\'s top/central/bottom LiDAR coordinates')
+    y.add_argument('--match', choices=('fast', 'cluster', 'both'), default='fast',
+                   help="how to separate the object from its background inside the box: "
+                        "'fast' = nearest range run (cheap), 'cluster' = depth-mode gate "
+                        "+ 3D voxel components (robust when the background sits at the "
+                        "same range), 'both' = run each on the same box and draw both, "
+                        "which is the only way to compare them on identical input")
+    y.add_argument('--match-voxel', type=float, default=0.08,
+                   help="voxel size for 'cluster' connectivity, metres")
+    y.add_argument('--anchor-axis', choices=('row', 'z'), default='row',
+                   help="define top/bottom by image row (default) or by world-up z "
+                        "in the LiDAR frame")
     d.add_argument('--color-max', type=float, default=0.0,
                    help='range where the colour ramp saturates (0 = use --max-depth); '
                         'drop it to ~10 indoors, where everything is otherwise one blue')
@@ -814,6 +798,12 @@ def main():
         buf = LidarBuffer(args.lidar_window, args.point_stride, args.filter_tags)
         shutdown = start_lidar(args, buf)
 
+    # Opened after the camera for the same reason live_cluster_match does it: an
+    # activated Hailo network group still open at interpreter teardown segfaults in
+    # libhailort, so nothing that can fail may run between claiming it and the
+    # try/finally that releases it.
+    cam = PanoramaSource(args)
+
     detector = None
     yolo_views = set()
     if args.yolo:
@@ -821,6 +811,7 @@ def main():
         try:
             detector = HailoYolo(args.yolo, conf=args.yolo_conf)
         except Exception as e:
+            cam.close()
             raise SystemExit(
                 f"cannot load {args.yolo}: {e}\n"
                 f"If this is an architecture mismatch, compare\n"
@@ -837,8 +828,9 @@ def main():
         print(f"yolo       : {args.yolo} {detector.input_size[0]}x{detector.input_size[1]} "
               f"on view(s) {sorted(yolo_views)}, conf {args.yolo_conf}"
               + (f", every {args.yolo_every} frames" if args.yolo_every > 1 else ""))
+        print(f"match      : {args.match}"
+              + (" (white = fast, cyan = cluster)" if args.match == 'both' else ""))
 
-    cam = PanoramaSource(args)
     canvas_maker = ViewCanvas(views, args.max_cols,
                               cv2.INTER_CUBIC if args.cubic else cv2.INTER_LINEAR)
 
@@ -850,6 +842,8 @@ def main():
     frame_no = 0
     detections = [[] for _ in views]
     yolo_ms = 0.0
+    methods = ('fast', 'cluster') if args.match == 'both' else (args.match,)
+    match_ms = {m: 0.0 for m in methods}
     projections = [(np.empty(0), np.empty(0), np.empty(0))] * len(views)
     d_cam = np.empty((0, 3), dtype=np.float32)
     rng = np.empty(0, dtype=np.float32)
@@ -908,33 +902,48 @@ def main():
                     draw_detections(tile, detections[i], detector)
                     located = 0
                     for det in detections[i]:
-                        anchor = object_anchors(vw, det, u, vv, rng, cam_origin32,
-                                                args.yolo_box_shrink,
-                                                args.yolo_cluster_gap,
-                                                args.yolo_min_points)
-                        if anchor is None:
+                        found = {}
+                        for method in methods:
+                            t_m = time.perf_counter()
+                            a = bm.match(vw, det, u, vv, rng, cam_origin32, method,
+                                         args.yolo_box_shrink, args.yolo_cluster_gap,
+                                         args.yolo_min_points, args.match_voxel,
+                                         args.anchor_axis)
+                            match_ms[method] = (time.perf_counter() - t_m) * 1000.0
+                            if a is not None:
+                                found[method] = a
+                                draw_anchors(tile, a, MATCH_COLORS[method])
+                        if not found:
                             continue
                         located += 1
-                        draw_anchors(tile, anchor)
-                        c = anchor['central']
-                        cv2.putText(tile, f"{anchor['range']:.1f}m "
+                        shown = found.get('cluster', found.get('fast'))
+                        c = shown['central']
+                        cv2.putText(tile, f"{shown['range']:.1f}m "
                                           f"({c[0]:+.1f},{c[1]:+.1f},{c[2]:+.1f})",
                                     (int(det[0]) + 2, min(int(det[3]) - 4, vw.size - 4)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
                                     cv2.LINE_AA)
                         if args.yolo_print:
-                            t_, b_ = anchor['top'], anchor['bottom']
-                            print(f"  [{i}] {detector.label(det[5])} {det[4]:.2f}  "
-                                  f"{anchor['n']:4d} pts  range {anchor['range']:5.2f} m | "
-                                  f"top {np.round(t_, 2)}  central {np.round(c, 2)}  "
-                                  f"bottom {np.round(b_, 2)}  (LiDAR frame)")
+                            for method, a in found.items():
+                                print(f"  [{i}] {detector.label(det[5])} {det[4]:.2f} "
+                                      f"{method:>7s}: {a['n']:4d} pts  "
+                                      f"range {a['range']:5.2f} m  "
+                                      f"top {np.round(a['top'], 2)}  "
+                                      f"central {np.round(a['central'], 2)}  "
+                                      f"bottom {np.round(a['bottom'], 2)}")
+                            if len(found) == 2:
+                                # The number that matters when comparing: how far apart
+                                # the two methods place the same object.
+                                gap3 = np.linalg.norm(found['fast']['central']
+                                                      - found['cluster']['central'])
+                                print(f"        fast vs cluster centre disagreement: "
+                                      f"{gap3:.2f} m")
+                    timing = "  ".join(f"{m}{match_ms[m]:.1f}ms" for m in methods)
                     label_view(tile, f"[{i}] {vw.label}",
                                f"{n} pts  {len(detections[i])} det  {located} located  "
-                               f"{yolo_ms:.0f} ms  {fps:.1f} fps")
+                               f"yolo {yolo_ms:.0f} ms  {timing}  {fps:.1f} fps")
                 else:
                     label_view(tile, f"[{i}] {vw.label}", f"{n} pts  {fps:.1f} fps")
-                print(f"\rframe {frame_no}  {n} pts on view {i}  "
-                      f"{len(d_cam)} total  {fps:.1f} fps", end='')
             if show_pano:
                 # The only consumer that needs every point in the panorama frame, so
                 # it pays for that rotation itself -- and only while it is on screen.
@@ -951,6 +960,15 @@ def main():
             if now - t_fps >= 1.0:
                 fps = n_frames / (now - t_fps)
                 n_frames, t_fps = 0, now
+
+            if args.stats:
+                # One line per frame, rewritten in place. Printing inside the view loop
+                # instead makes the views overwrite each other, and costs a syscall per
+                # view rather than per frame.
+                print(f"\rframe {frame_no}  {len(d_cam)} pts  {fps:4.1f} fps  "
+                      f"camera dropped {cam.dropped} skipped {cam.skipped}"
+                      + (f"  lidar msgs {buf.n_msgs} dropped {buf.dropped}"
+                         if buf is not None else "") + "   ", end='', flush=True)
 
             snap = bool(args.snapshot_interval) and now - last_snapshot >= args.snapshot_interval
 

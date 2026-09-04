@@ -20,7 +20,6 @@ HEF on a HAILO8L device outright. Check with `hailortcli parse-hef <file>` again
 import os
 
 import cv2
-import numpy as np
 
 
 def load_class_names(hef_path):
